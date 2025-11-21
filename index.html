@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Blogger ➜ Instagram Poster Generator</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#ff6b6b}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;margin:0;background:#0f1724;color:#e6eef8;display:flex;align-items:flex-start;gap:24px;padding:28px;min-height:100vh}
+    .panel{width:420px;background:linear-gradient(180deg,#071028 0,#0b1220 100%);padding:18px;border-radius:12px;box-shadow:0 8px 30px rgba(2,6,23,.8)}
+    h1{font-size:18px;margin:0 0 10px}
+    label{display:block;font-size:13px;margin:10px 0 6px;color:#bcd2ff}
+    input[type=text],select{width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02);color:inherit}
+    button{margin-top:12px;padding:10px 12px;border-radius:10px;border:0;background:var(--accent);color:#06121a;font-weight:700;cursor:pointer}
+    small{color:#9fb2e6}
+    .preview{flex:1;display:flex;align-items:center;justify-content:center}
+    .canvas-wrap{background:#fff;padding:12px;border-radius:10px}
+    canvas{display:block;border-radius:6px}
+    .hint{margin-top:8px;color:#9fb2e6;font-size:13px}
+    .row{display:flex;gap:8px}
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>Blogger → Instagram poster (1080×1080)</h1>
+    <label for="url">Paste Blogger post URL</label>
+    <input id="url" type="text" placeholder="https://yourblog.blogspot.com/2025/11/sample-post.html" />
+
+    <label for="proxy">If fetch fails due to CORS, choose a proxy (optional)</label>
+    <select id="proxy">
+      <option value="">No proxy (best if allowed)</option>
+      <option value="https://api.allorigins.win/raw?url=">AllOrigins (free)</option>
+      <option value="https://corsproxy.io/?">CORSProxy.io (free)</option>
+    </select>
+
+    <label for="titleOverride">Title override (optional)</label>
+    <input id="titleOverride" type="text" placeholder="Leave empty to use post title" />
+
+    <label for="logoUrl">Logo URL (optional) — will try to auto-find if empty</label>
+    <input id="logoUrl" type="text" placeholder="https://example.com/logo.png" />
+
+    <div class="row">
+      <button id="generate">Generate Poster</button>
+      <button id="download" disabled>Download PNG</button>
+    </div>
+
+    <div class="hint">This page tries to read the post and use the first image (og:image or first &lt;img&gt;) and the post title. If the remote site blocks cross-origin fetch, choose a proxy above or paste a direct image URL into the Logo field.</div>
+  </div>
+
+  <div class="preview">
+    <div class="canvas-wrap">
+      <canvas id="canvas" width="1080" height="1080"></canvas>
+    </div>
+  </div>
+
+<script>
+async function fetchText(url, proxyPrefix){
+  const fetchUrl = proxyPrefix ? proxyPrefix + encodeURIComponent(url) : url;
+  const res = await fetch(fetchUrl);
+  if(!res.ok) throw new Error('Fetch failed: '+res.status);
+  return await res.text();
+}
+
+function parseHTML(html){
+  return new DOMParser().parseFromString(html, 'text/html');
+}
+
+function findFirstImage(doc){
+  const og = doc.querySelector('meta[property="og:image"]') || doc.querySelector('meta[name="og:image"]');
+  if(og && og.content) return og.content;
+  const articleImgs = doc.querySelectorAll('article img, .post img, img');
+  for(const img of articleImgs){
+    const src = img.getAttribute('src') || img.getAttribute('data-src');
+    if(src) return src;
+  }
+  const imgs = Array.from(doc.images);
+  imgs.sort((a,b)=> (b.naturalWidth||b.width) - (a.naturalWidth||a.width));
+  if(imgs[0]) return imgs[0].src || imgs[0].getAttribute('data-src');
+  return null;
+}
+
+function findTitle(doc){
+  const og = doc.querySelector('meta[property="og:title"]') || doc.querySelector('meta[name="og:title"]');
+  if(og && og.content) return og.content;
+  const t = doc.querySelector('title');
+  if(t) return t.textContent.trim();
+  const h1 = doc.querySelector('h1');
+  if(h1) return h1.textContent.trim();
+  return '';
+}
+
+function findLogo(doc, baseUrl){
+  const icon = doc.querySelector('link[rel~="icon"]') || doc.querySelector('link[rel~="shortcut icon"]');
+  if(icon){
+    let url = icon.getAttribute('href');
+    if(url && !url.startsWith('http')){
+      try{ url = new URL(url, baseUrl).href }catch(e){}
+    }
+    return url;
+  }
+  const logo = doc.querySelector('[id*=logo], [class*=logo] img, header img');
+  if(logo){
+    const src = logo.getAttribute('src') || logo.getAttribute('data-src');
+    if(src) return (src.startsWith('http')?src: new URL(src, baseUrl).href);
+  }
+  return null;
+}
+
+function loadImage(url){
+  return new Promise((res,rej)=>{
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = ()=>res(img);
+    img.onerror = (e)=>rej(new Error('Image load error: '+url));
+    img.src = url;
+  });
+}
+
+function drawCover(ctx, img, w, h){
+  const rw = w / img.width;
+  const rh = h / img.height;
+  const r = Math.max(rw, rh);
+  const iw = img.width * r;
+  const ih = img.height * r;
+  const ox = (w - iw) / 2;
+  const oy = (h - ih) / 2;
+  ctx.drawImage(img, ox, oy, iw, ih);
+}
+
+function wrapText(ctx, text, maxWidth){
+  const words = text.split(/\s+/);
+  const lines = [];
+  let line = '';
+  for(const word of words){
+    const test = line ? line + ' ' + word : word;
+    const metrics = ctx.measureText(test);
+    if(metrics.width > maxWidth && line){
+      lines.push(line); line = word;
+    } else {
+      line = test;
+    }
+  }
+  if(line) lines.push(line);
+  return lines;
+}
+
+async function generateFromUrl(postUrl, proxyPrefix, titleOverride, logoUrlOverride){
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // blank background
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0,0,W,H);
+
+  // Try fetch and parse
+  try{
+    const html = await fetchText(postUrl, proxyPrefix);
+    const doc = parseHTML(html);
+    const title = titleOverride || findTitle(doc) || 'Untitled';
+    let imgUrl = findFirstImage(doc);
+    let logoUrl = logoUrlOverride || findLogo(doc, postUrl) || null;
+
+    if(imgUrl && imgUrl.startsWith('//')) imgUrl = 'https:'+imgUrl;
+    if(logoUrl && logoUrl.startsWith('//')) logoUrl = 'https:'+logoUrl;
+
+    if(imgUrl && !imgUrl.startsWith('http')){
+      try{ imgUrl = new URL(imgUrl, postUrl).href }catch(e){}
+    }
+
+    // Load background image (if any)
+    let bgImg = null;
+    if(imgUrl){
+      try{ bgImg = await loadImage(imgUrl); }
+      catch(e){ console.warn('bg load failed', e); bgImg=null; }
+    }
+
+    if(bgImg){
+      drawCover(ctx, bgImg, W, H);
+      // dark overlay for text contrast
+      ctx.fillStyle = 'rgba(6,8,12,0.45)';
+      ctx.fillRect(0,0,W,H);
+    } else {
+      // fall back gradient
+      const g = ctx.createLinearGradient(0,0,0,H);
+      g.addColorStop(0,'#2b3340'); g.addColorStop(1,'#0b1220');
+      ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+    }
+
+    // Draw title — large, wrapped
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#ffffff';
+    const padding = 80;
+    const maxTextWidth = W - padding*2;
+    let baseSize = 64;
+    ctx.font = `800 ${baseSize}px Inter, sans-serif`;
+
+    while(ctx.measureText(title).width > maxTextWidth && baseSize > 28){ baseSize -= 4; ctx.font = `800 ${baseSize}px Inter, sans-serif`; }
+
+    ctx.font = `800 ${baseSize}px Inter, sans-serif`;
+    const lines = wrapText(ctx, title, maxTextWidth);
+
+    while(lines.length > 3 && baseSize > 28){ baseSize -= 4; ctx.font = `800 ${baseSize}px Inter, sans-serif`; lines.length = 0; lines.push(...wrapText(ctx, title, maxTextWidth)); }
+
+    const lineHeight = baseSize * 1.05;
+    const textHeight = lines.length * lineHeight;
+    let yStart = (H - textHeight)/2 + 60;
+    ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 12; ctx.shadowOffsetY = 6;
+    ctx.fillStyle = '#fff';
+    for(let i=0;i<lines.length;i++){
+      const lineText = lines[i];
+      const measure = ctx.measureText(lineText);
+      const x = (W - measure.width)/2;
+      ctx.fillText(lineText, x, yStart + i*lineHeight);
+    }
+    ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+
+    // Draw logo if available
+    if(logoUrl){
+      try{
+        const logoImg = await loadImage(logoUrl);
+        // draw circular logo in bottom-right
+        const logoSize = 120;
+        const margin = 48;
+        const x = W - logoSize - margin; const y = H - logoSize - margin;
+        // draw white circle background
+        ctx.beginPath(); ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.arc(x + logoSize/2, y + logoSize/2, logoSize/2 + 6, 0, Math.PI*2); ctx.fill();
+        // draw logo clipped
+        ctx.save(); ctx.beginPath(); ctx.arc(x + logoSize/2, y + logoSize/2, logoSize/2, 0, Math.PI*2); ctx.closePath(); ctx.clip();
+        drawCover(ctx, logoImg, logoSize, logoSize);
+        ctx.restore();
+      } catch(e){ console.warn('logo load failed', e); }
+    }
+
+    // small site credit at bottom-left
+    ctx.font = '600 20px Inter, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    const siteText = (new URL(postUrl)).hostname.replace('www.','');
+    ctx.fillText(siteText, 48, H - 48 - 20);
+
+    return {success:true};
+  } catch(err){
+    console.error(err);
+    const ctx = document.getElementById('canvas').getContext('2d');
+    ctx.fillStyle = '#1b2430'; ctx.fillRect(0,0,1080,1080);
+    ctx.fillStyle = '#ff6b6b'; ctx.font = '700 32px Inter, sans-serif'; ctx.fillText('Failed to fetch or parse the URL', 60, 60);
+    ctx.font = '500 20px Inter, sans-serif'; ctx.fillText(err.message || String(err), 60, 110);
+    return {success:false, error:err.message};
+  }
+}
+
+// UI wiring
+const generateBtn = document.getElementById('generate');
+const downloadBtn = document.getElementById('download');
+generateBtn.addEventListener('click', async ()=>{
+  const url = document.getElementById('url').value.trim();
+  if(!url){ alert('Please paste a Blog post URL'); return; }
+  const proxy = document.getElementById('proxy').value || '';
+  const titleOverride = document.getElementById('titleOverride').value.trim();
+  const logoOverride = document.getElementById('logoUrl').value.trim() || null;
+  generateBtn.disabled = true; generateBtn.textContent = 'Generating...';
+  const res = await generateFromUrl(url, proxy, titleOverride, logoOverride);
+  generateBtn.disabled = false; generateBtn.textContent = 'Generate Poster';
+  if(res.success){ downloadBtn.disabled = false; }
+});
+downloadBtn.addEventListener('click', ()=>{
+  const canvas = document.getElementById('canvas');
+  const link = document.createElement('a');
+  link.download = 'poster.png';
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+});
+
+// initial placeholder visual
+(function placeholder(){
+  const c = document.getElementById('canvas'); const ctx = c.getContext('2d');
+  ctx.fillStyle = '#0b1220'; ctx.fillRect(0,0,c.width,c.height);
+  ctx.fillStyle = '#fff'; ctx.font = '700 32px Inter, sans-serif'; ctx.fillText('Instagram Poster Preview', 60, 120);
+  ctx.font = '500 18px Inter, sans-serif'; ctx.fillText('Paste a Blogger post URL and click Generate', 60, 164);
+})();
+</script>
+</body>
+</html>
